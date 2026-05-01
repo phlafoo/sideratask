@@ -1,36 +1,92 @@
-use std::{cmp::Reverse, ops::Deref};
+use std::cmp::{Ordering, Reverse};
 
-use chrono::{Datelike, Duration, NaiveDate, TimeDelta};
+use chrono::{Datelike, Duration, NaiveDate};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::{Season, Task};
+use crate::{effort, Season, TaskLog, TaskRow};
 
+/// Used in generator algorithm
+#[derive(Clone, Debug)]
+pub struct Task {
+    id: usize,
+    instructions: String,
+    period_days: i32,
+    effort: u8, // 1, 2, 3, 5, or 8
+    season: Season,
+    /// How many days until this task should be done again. Negative value mean it is overdue.
+    days_until: i32,
+    /// This combines days_until with period so that shorter period tasks are prioritized more when
+    /// overdue, and longer period tasks are prioritized when no tasks are due. Lower values mean the
+    /// task is more overdue.
+    slack: f32,
+}
+
+impl Task {
+    const DAY_OFF_ID: usize = 0;
+
+    fn with_period(mut self, period_days: i32) -> Self {
+        self.period_days = period_days;
+        self
+    }
+
+    fn get_day_off_task() -> Self {
+        Task {
+            id: Task::DAY_OFF_ID,
+            instructions: "Day off".to_string(),
+            period_days: 0,
+            effort: 0,
+            season: Season::Any,
+            days_until: 0,
+            slack: 0.0,
+        }
+    }
+
+    fn get_holiday_task() -> Self {
+        let mut task = Task::get_day_off_task();
+        task.instructions = "Holiday".to_string();
+        task
+    }
+}
+
+impl From<&TaskRow> for Task {
+    fn from(value: &TaskRow) -> Self {
+        Task {
+            id: value.id,
+            instructions: value.instructions.clone(),
+            period_days: value.period_days,
+            effort: value.effort,
+            season: value.season,
+            days_until: 0,
+            slack: 0.0,
+        }
+    }
+}
+
+/// The final cleaning list uses this type
+#[derive(Clone, Debug)]
 pub struct DatedTask {
     pub id: usize,
     pub do_date: NaiveDate,
     pub instructions: String,
+    /// Just for debugging
+    #[allow(dead_code)]
+    pub days_until_when_added: i32,
 }
 
 impl DatedTask {
-    fn new(id: usize, do_date: NaiveDate, instructions: String) -> Self {
-        DatedTask {
-            id,
-            do_date,
-            instructions,
-        }
-    }
-
     fn from_task(task: &Task, do_date: NaiveDate) -> Self {
         DatedTask {
             id: task.id,
             do_date,
             instructions: task.instructions.clone(),
+            days_until_when_added: task.days_until,
         }
     }
 }
 
 impl Task {
+    /// The first instance of a task should happen randomly between start_date and start_date + period
     fn set_days_until<R: Rng + ?Sized>(
         &mut self,
         rng: &mut R,
@@ -60,8 +116,43 @@ impl Task {
 }
 
 /// Returns list of dated tasks
-pub fn generate_cleaning_list(mut tasks: Vec<Task>, start_date: NaiveDate) -> String {
-    // Logic relies on always ending on Dec 31
+pub fn generate_cleaning_list(
+    task_rows: &[TaskRow],
+    mut history: Vec<TaskLog>,
+    current_year: i32,
+    seed: Option<u64>,
+) -> Vec<DatedTask> {
+    // The start date will be the day after the most recent record
+    history.sort_by_key(|t| Reverse(t.date));
+
+    let start_date = if let Some(most_recent_record) = history.first() {
+        most_recent_record.date + Duration::days(1)
+    } else {
+        // No history, default to Jan 1st
+        NaiveDate::from_ymd_opt(current_year, 1, 1).unwrap()
+    };
+
+    if start_date.year() > current_year {
+        panic!("History is in the future or too recent");
+    }
+
+    // Convert TaskRow -> Task
+    let mut tasks: Vec<Task> = task_rows.iter().map(From::from).collect();
+
+    // All that is needed to integrate history into the algorithm, is to set the days_until based on
+    // the last time the task was done
+    for task in tasks.iter_mut() {
+        if task.id == Task::DAY_OFF_ID {
+            panic!("Task ID 0 is reserved for implicit 'day off' task");
+        }
+        // Scan history in descending order of date to get the most recent one
+        if let Some(task_record) = history.iter().find(|r| r.id == task.id) {
+            let days_ago = (start_date - task_record.date).num_days() as i32;
+            task.days_until = task.period_days - days_ago;
+        }
+    }
+
+    // For now we always end on Dec 31
     let year = start_date.year();
     let end_date = NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
     assert!(start_date < end_date);
@@ -74,6 +165,7 @@ pub fn generate_cleaning_list(mut tasks: Vec<Task>, start_date: NaiveDate) -> St
     ];
     let total_days = (end_date - start_date).num_days() as i32;
 
+    // For the 'days off' task we need to approximate the period based on the periods of other tasks
     let tasks_per_day = tasks
         .iter()
         .map(|t| 1.0 / t.period_days as f32)
@@ -81,8 +173,8 @@ pub fn generate_cleaning_list(mut tasks: Vec<Task>, start_date: NaiveDate) -> St
     let holidays_per_day = holidays.len() as f32 / total_days as f32;
     let days_off_per_day = 1.0 - (tasks_per_day + holidays_per_day);
     if days_off_per_day > 0.0 {
-        let days_off_period = (1.0 / days_off_per_day) as i32;
-        tasks.push(Task::get_day_off_task(days_off_period));
+        let day_off_task = Task::get_day_off_task().with_period((1.0 / days_off_per_day) as i32);
+        tasks.push(day_off_task);
     }
 
     let mut summer_start = NaiveDate::from_ymd_opt(year, 5, 1).unwrap();
@@ -92,19 +184,23 @@ pub fn generate_cleaning_list(mut tasks: Vec<Task>, start_date: NaiveDate) -> St
     //  1. summer_start >= start_date
     //  2. summer_end > start_date
     if start_date >= summer_end {
-        summer_end.with_year(year + 1);
-        summer_start.with_year(year + 1);
+        summer_end = summer_end.with_year(year + 1).unwrap();
+        summer_start = summer_start.with_year(year + 1).unwrap();
     } else if start_date > summer_start {
         summer_start = start_date;
     }
 
     let days_until_summer_start = (summer_start - start_date).num_days() as i32;
     let days_until_summer_end = (summer_end - start_date).num_days() as i32;
+    let mut cleaning_list = Vec::new();
 
-    const SEED: u64 = 1;
-    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
-    // let mut rng = ChaCha8Rng::from_rng(&mut rand::rng());
+    let mut rng = if let Some(seed) = seed {
+        ChaCha8Rng::seed_from_u64(seed)
+    } else {
+        ChaCha8Rng::from_rng(&mut rand::rng())
+    };
 
+    // Set `days_until` to determine when the first occurence of each task should be
     for task in tasks.iter_mut().filter(|t| t.days_until == 0) {
         task.set_days_until(
             &mut rng,
@@ -114,32 +210,36 @@ pub fn generate_cleaning_list(mut tasks: Vec<Task>, start_date: NaiveDate) -> St
         );
     }
 
-    let mut cleaning_list = Vec::new();
-
+    // Helper to add task to cleaning list
     let mut add_task = |task: &mut Task, date: NaiveDate| {
-        cleaning_list.push((DatedTask::from_task(task, date), task.days_until));
-        task.days_until = task.period_days;
+        cleaning_list.push(DatedTask::from_task(task, date));
+        task.days_until = task.period_days; // must be updated AFTER adding to list
+    };
+
+    /// Task `slack` is the signed squared error (error is `days_until`) multiplied by the inverse
+    /// `period_days` raised to `PERIOD_POWER`. So setting this to 1.0 would make the slack proportional
+    /// to the inverse of `period_days`, but that doesn't create quite enough difference between low
+    /// and high period tasks. The exact value is arbitrary but 1.5 seems to produce well balanced
+    /// output.
+    const PERIOD_POWER: f32 = 1.5; // ;)
+
+    // This helper should be called every day for every task to update `days_until` and `slack`.
+    let update_slack = |task: &mut Task| {
+        task.days_until -= 1;
+
+        // Weight by period. This way shorter period tasks are prioritized more when overdue, and
+        // longer period tasks are prioritized when no tasks are due.
+        let weight = 1.0 / (task.period_days as f32).powf(PERIOD_POWER);
+        let signed_sq_err = task.days_until as f32 * (task.days_until as f32).abs();
+        task.slack = signed_sq_err * weight;
     };
 
     let mut prev_effort = 0;
 
-    // Max one task per day
+    // Exactly one task per day (counting 'day off' as a task)
     for current_date in start_date.iter_days().take_while(|&d| d <= end_date) {
-        for task in &mut tasks {
-            task.days_until -= 1;
-        }
-
-        let mut dtasks = tasks.clone();
-        dtasks.sort_by_key(|t| t.days_until);
-        // println!(
-        //     "{}",
-        //     dtasks
-        //         .iter()
-        //         .take(10)
-        //         .map(|t| format!("{:>3}", t.days_until))
-        //         .collect::<Vec<String>>()
-        //         .join(" ")
-        // );
+        // Daily update
+        tasks.iter_mut().for_each(update_slack);
 
         if holidays.contains(&current_date) {
             add_task(&mut Task::get_holiday_task(), current_date);
@@ -147,75 +247,36 @@ pub fn generate_cleaning_list(mut tasks: Vec<Task>, start_date: NaiveDate) -> St
             continue;
         }
 
+        // Other constraints:
+        //  - Don't do high effort tasks back to back
+        //  - Don't do summer tasks outside of summer
         let valid_tasks: Vec<&mut Task> = {
-            // If yesterday's task was high effort (>=5), today's task should be at most effort 3
-            let max_effort = if prev_effort >= 5 { 3 } else { 8 };
-            let iter = tasks.iter_mut().filter(|t| t.effort <= max_effort);
-
-            let is_summer = summer_start < current_date && current_date < summer_end;
-            if is_summer {
-                iter.collect()
+            let max_effort = if prev_effort >= effort::HARD {
+                effort::MODERATE
             } else {
-                iter.filter(|t| t.season != Season::Summer).collect()
-            }
+                effort::EXTREME
+            };
+            let is_summer = summer_start < current_date && current_date < summer_end;
+
+            tasks
+                .iter_mut()
+                .filter(|t| t.effort <= max_effort)
+                .filter(|t| is_summer || t.season != Season::Summer)
+                .collect()
         };
 
-        let min_days_until = valid_tasks
-            .iter()
-            .min_by_key(|t| t.days_until)
-            .unwrap()
-            .days_until;
-
-        let urgent = min_days_until <= 0;
-
-        // Any task with the minimum days_until is a candidate
-        let candidate_iter = valid_tasks
+        // Pick lowest `slack` task. On tie, pick lower `period_days` task
+        let next_task = valid_tasks
             .into_iter()
-            .filter(|t| t.days_until == min_days_until);
+            .min_by(|a, b| match a.slack.total_cmp(&b.slack) {
+                Ordering::Equal => a.period_days.cmp(&b.period_days),
+                ord => ord,
+            })
+            .expect("need at least 1 valid task");
 
-        // Smaller period tasks are less flexible than larger period tasks. So if any tasks are
-        // urgent, select the candidate with the SMALLEST period - otherwise select the candidate
-        // with the LARGEST period.
-        let next_task = if urgent {
-            candidate_iter.min_by_key(|t| t.period_days).unwrap()
-        } else {
-            candidate_iter.max_by_key(|t| t.period_days).unwrap()
-        };
         add_task(next_task, current_date);
         prev_effort = next_task.effort;
     }
 
-    // print_summary(&tasks, &cleaning_list);
-
-    // Create TSV string (an extra tab is placed after date column for the checkbox column)
     cleaning_list
-        .iter()
-        .map(|task| {
-            format!(
-                "{}\t{}\t{}\t{}",
-                task.0.id, task.0.do_date, task.1, task.0.instructions
-            )
-        })
-        .collect::<Vec<String>>()
-        .join("\n")
-    // let tsv_output = cleaning_list
-    //     .iter()
-    //     .map(|task| format!("{}\t{}\t\t{}", task.id, task.do_date, task.instructions))
-    //     .collect::<Vec<String>>()
-    //     .join("\n");
-
-    // cleaning_list
-}
-
-fn print_summary(tasks: &[Task], cleaning_list: &[(DatedTask, i32)]) {
-    println!("period | count | task");
-    println!("-------+-------+-----");
-    for task in tasks.iter() {
-        let count = cleaning_list.iter().filter(|dt| dt.0.id == task.id).count();
-        println!(
-            "{:>6} | {:>5} | {}",
-            task.period_days, count, task.instructions
-        );
-    }
-    println!("-------+-------+-----");
 }

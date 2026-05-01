@@ -1,17 +1,15 @@
-// TODO remove
-#![allow(unused)]
+// #![allow(unused)]
 
-use chrono::{Datelike, Duration, NaiveDate};
+use chrono::NaiveDate;
 use clap::Parser;
-use fnv::FnvHashMap;
 use generator::generate_cleaning_list;
 use serde::{de, Deserialize};
-use std::cmp::Reverse;
-use std::env;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+
+use crate::generator::DatedTask;
 
 mod generator;
 
@@ -46,65 +44,80 @@ enum Season {
 /// Fields map to headers in google sheet
 #[allow(dead_code)]
 #[derive(Clone, Debug, Default, Deserialize)]
-pub struct Task {
+pub struct TaskRow {
     id: usize,
     #[serde(rename = "task")]
     instructions: String,
     period_days: i32,
-    effort: u8, // 1, 2, 3, 5, or 8
+    /// Current possible values: 1, 2, 3, 5, or 8
+    effort: u8,
     area: Area,
     season: Season,
     created_at: NaiveDate,
-    /// How many days until this task should be done again. Negative value mean it is overdue.
-    #[serde(skip)]
-    days_until: i32,
 }
 
-impl Task {
-    const DAY_OFF_ID: usize = 0;
-
-    fn get_day_off_task(period_days: i32) -> Self {
-        Task {
-            id: Task::DAY_OFF_ID,
-            instructions: "Day off".to_string(),
-            period_days,
-            effort: 0,
-            area: Area::None,
-            season: Season::Any,
-            created_at: NaiveDate::MIN,
-            days_until: 0,
-        }
-    }
-
-    fn get_holiday_task() -> Self {
-        let mut task = Task::get_day_off_task(0);
-        task.instructions = "Holiday".to_string();
-        task
-    }
+#[allow(dead_code)]
+mod effort {
+    pub const EASY: u8 = 2;
+    pub const MODERATE: u8 = 3;
+    pub const HARD: u8 = 5;
+    pub const EXTREME: u8 = 8;
 }
 
 #[derive(Parser, Debug)]
 struct Args {
+    /// Which year to generate the cleaning list for
     #[arg(short, long)]
     year: i32,
-    #[arg(short, long)]
+    #[arg(long)]
+    /// Can be found in sheet share url: https://docs.google.com/spreadsheets/d/<sheet_id>/edit?usp=sharing
     sheet_id: String,
+    /// (Optional) Seed for RNG. Must be a positive number.
+    #[arg(short, long)]
+    seed: Option<u64>,
 }
 
-/// Run with `cargo run -- --year <year> --sheet-id <sheet_id>`
+// cargo run -- --help
 fn main() -> Result<(), Box<dyn Error>> {
-    // sheet_id comes from public share link for google sheet
-    let Args { year, sheet_id } = Args::parse();
+    let Args {
+        year,
+        sheet_id,
+        seed,
+    } = Args::parse();
 
-    let mut tasks = get_tasks(&sheet_id)?;
-    let start_date = process_history(&mut tasks, &sheet_id, year)?;
-    let tsv = generate_cleaning_list(tasks, start_date);
+    let tasks = get_tasks(&sheet_id)?;
+    let history = get_history(&sheet_id)?;
+
+    println!("Generating cleaning list...");
+    let cleaning_list = generate_cleaning_list(&tasks, history, year, seed);
+    println!("Finished generating cleaning list!");
+
+    print_summary(&tasks, &cleaning_list);
+
+    // Create TSV string (an extra tab is placed after date column for the checkbox column)
+    let tsv = cleaning_list
+        .iter()
+        .map(|task| format!("{}\t{}\t\t{}", task.id, task.do_date, task.instructions))
+        .collect::<Vec<String>>()
+        .join("\n");
+
+    // DEBUG
+    // let tsv = cleaning_list
+    //     .iter()
+    //     .map(|task| {
+    //         format!(
+    //             "{}\t{}\t{}\t{}",
+    //             task.id, task.do_date, task.days_until_when_added, task.instructions
+    //         )
+    //     })
+    //     .collect::<Vec<String>>()
+    //     .join("\n")
 
     let path = Path::new("output/cleaning-list.tsv");
     let mut tsv_file = File::create(path)?;
     tsv_file.write_all(tsv.as_bytes())?;
 
-    println!("Saved to file: {:#?}", path);
+    println!("✅ Success! Saved to file: {:#?}", path);
 
     Ok(())
 }
@@ -115,12 +128,11 @@ fn get_sheet_url(sheet_id: &str, sheet_name: &str) -> String {
     )
 }
 
-fn get_tasks(sheet_id: &str) -> Result<Vec<Task>, Box<dyn Error>> {
-    // Setup url
+fn get_tasks(sheet_id: &str) -> Result<Vec<TaskRow>, Box<dyn Error>> {
+    // Download the CSV data
     let sheet_url = get_sheet_url(sheet_id, "tasks");
 
-    // Download the data
-    println!("Fetching data...");
+    println!("Fetching tasks...");
     let response = reqwest::blocking::get(sheet_url)?;
     response.error_for_status_ref().unwrap();
     let csv = response.text()?;
@@ -129,14 +141,14 @@ fn get_tasks(sheet_id: &str) -> Result<Vec<Task>, Box<dyn Error>> {
     let mut reader = csv::Reader::from_reader(csv.as_bytes());
     let mut tasks = Vec::new();
 
-    for row in reader.deserialize::<Task>() {
+    for row in reader.deserialize::<TaskRow>() {
         match row {
             Ok(task) => {
-                if task.id == Task::DAY_OFF_ID {
-                    panic!("Task ID 0 is reserved for implicit 'day off' task");
-                }
                 if task.period_days == 0 {
-                    println!("Skipping task with period of 0 days, task ID = {}", task.id);
+                    println!(
+                        "⚠️ Skipping task with period of 0 days, task ID = {}",
+                        task.id
+                    );
                     continue;
                 }
                 tasks.push(task);
@@ -150,7 +162,7 @@ fn get_tasks(sheet_id: &str) -> Result<Vec<Task>, Box<dyn Error>> {
     if tasks.is_empty() {
         panic!("No tasks found");
     }
-    println!("Fetched {} tasks", tasks.len());
+    println!("✅ Found {} task(s)", tasks.len());
 
     // Sort so that the output is consistent (with the same seed) regardless of how the sheet is sorted
     tasks.sort_by_key(|t| t.id);
@@ -160,7 +172,7 @@ fn get_tasks(sheet_id: &str) -> Result<Vec<Task>, Box<dyn Error>> {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-struct TaskRecord {
+struct TaskLog {
     id: usize,
     date: NaiveDate,
     #[serde(deserialize_with = "deserialize_google_bool")]
@@ -184,16 +196,11 @@ where
     }
 }
 
-/// Returns start date (day after most recent history)
-fn process_history(
-    tasks: &mut [Task],
-    sheet_id: &str,
-    current_year: i32,
-) -> Result<NaiveDate, Box<dyn Error>> {
-    // First we get history by looking at sheet names. Each year should have it's own sheet and they
-    // should be named "2025", "2026", etc. The `/edit` endpoint returns a ton of data, but it is the
-    // only way I was able to dynamically extract sheet names. The alternative is to manually provide
-    // the GID of each sheet, or to just check the headers/data which seems a bit finicky.
+fn get_history(sheet_id: &str) -> Result<Vec<TaskLog>, Box<dyn Error>> {
+    // First we figure out what history to download by looking at sheet names. Each year should have
+    // it's own sheet and they should be named "2025", "2026", etc. The `/edit` endpoint returns a ton
+    // of data, but it is the only way I was able to dynamically extract sheet names. The alternative
+    // is to manually provide the GID of each sheet, or to just check the headers/data which seems a bit finicky.
     let url = format!("https://docs.google.com/spreadsheets/d/{sheet_id}/edit");
     let response = reqwest::blocking::get(url)?;
     let html = response.text()?;
@@ -207,7 +214,7 @@ fn process_history(
         .filter_map(|c| c.name("sheet_name").map(|s| s.as_str()))
         .collect();
 
-    let mut records = Vec::new();
+    let mut history = Vec::new();
 
     for year in years {
         // Setup url
@@ -221,10 +228,10 @@ fn process_history(
         // Parse the CSV data
         let mut reader = csv::Reader::from_reader(csv.as_bytes());
 
-        for row in reader.deserialize::<TaskRecord>() {
+        for row in reader.deserialize::<TaskLog>() {
             match row {
-                Ok(task_record) if task_record.done => {
-                    records.push(task_record);
+                Ok(log) if log.done => {
+                    history.push(log);
                 }
                 Err(e) => {
                     // If the sheet has any junk below the last row of data, this will trigger, so it
@@ -237,39 +244,21 @@ fn process_history(
         }
     }
 
-    println!("Found {} completed tasks in history", records.len());
+    println!("✅ Found {} completed task(s) in history", history.len());
 
-    // The start date will be the day after the most recent record
-    records.sort_by_key(|r| Reverse(r.date));
+    Ok(history)
+}
 
-    let Some(most_recent_record) = records.first() else {
-        // No history, default to Jan 1st
-        return Ok(NaiveDate::from_ymd_opt(current_year, 1, 1).unwrap());
-    };
-
-    let start_date = most_recent_record.date + Duration::days(1);
-    if start_date.year() > current_year {
-        panic!("History is in the future or too recent");
+fn print_summary(tasks: &[TaskRow], cleaning_list: &[DatedTask]) {
+    println!("Summary:");
+    println!("period | count | task");
+    println!("-------+-------+-----");
+    for task in tasks.iter() {
+        let count = cleaning_list.iter().filter(|dt| dt.id == task.id).count();
+        println!(
+            "{:>6} | {:>5} | {}",
+            task.period_days, count, task.instructions
+        );
     }
-
-    // All that is needed to integrate history into the algorithm, is to set the days_until based on
-    // the last time the task was done
-    for task in tasks.iter_mut() {
-        // Scan records in descending order of date to get the most recent one
-        if let Some(task_record) = records.iter().find(|r| r.id == task.id) {
-            let days_ago = (start_date - task_record.date).num_days() as i32;
-            task.days_until = task.period_days - days_ago;
-        }
-    }
-
-    // for task_record in &records {
-    //     let task = tasks
-    //         .iter_mut()
-    //         .find(|t| t.id == task_record.id)
-    //         .unwrap_or_else(|| panic!("History contains invalid task with ID {}", task_record.id));
-    //     let days_ago = (start_date - task_record.date).num_days() as i32;
-    //     task.days_until = task.period_days - days_ago;
-    // }
-
-    Ok(start_date)
+    println!("-------+-------+-----");
 }
