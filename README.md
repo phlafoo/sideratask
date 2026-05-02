@@ -11,7 +11,7 @@ The program reads a list of possible tasks from a Google Sheets spreadsheet and 
 1. Make a copy of [this template spreadsheet](https://docs.google.com/spreadsheets/d/1uoebxYatU9ud_ME0-J_4uzoEzqzodgb1DrWzt6Xblp8/edit?usp=sharing) in Google Sheets. The program relies on the spreadsheet using an exact format.
 2. Customize the task list. Note that:
     1. Each task must have a unique ID.
-    2. Currently only 1 task can be scheduled per day, so for best results the `period_days` across all tasks should ensure that the total average tasks per day rate is less than or equal to 1. If it is higher than 1 then the longer period tasks may be neglected. To check this, simply sum over the reciprocals of `period_days` column, for example using this formula `=SUMPRODUCT(IFERROR(1/C2:C, 0))`.
+    2. Currently only 1 task can be scheduled per day, so for best results the `period_days` across all tasks should ensure that the total average tasks per day rate is less than or equal to 1. If it is higher than 1 then the longer period tasks may be neglected. If it is below 1, then some days will have no task. To check this, simply sum over the reciprocals of `period_days` column, for example by using this formula `=SUMPRODUCT(IFERROR(1/C2:C, 0))`.
     3. The algorithm will not schedule high effort (5+) tasks on back to back days.
     4. `effort` is a drop down in the template but the value can be any number.
     4. Tasks with `season` set to `Summer` can only be scheduled between May 1st and August 31.
