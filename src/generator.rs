@@ -4,7 +4,7 @@ use chrono::{Datelike, Duration, NaiveDate};
 use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::{effort, Season, TaskLog, TaskRow};
+use crate::loader::{effort, Season, TaskLog, TaskRow};
 
 /// Used in generator algorithm
 #[derive(Clone, Debug)]
@@ -118,6 +118,7 @@ impl Task {
 /// Returns list of dated tasks
 pub fn generate_cleaning_list(
     task_rows: &[TaskRow],
+    holidays: &[NaiveDate],
     mut history: Vec<TaskLog>,
     current_year: i32,
     seed: Option<u64>,
@@ -157,12 +158,6 @@ pub fn generate_cleaning_list(
     let end_date = NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
     assert!(start_date < end_date);
 
-    let holidays = [
-        NaiveDate::from_ymd_opt(year, 1, 1).unwrap(), // New years day
-        NaiveDate::from_ymd_opt(year, 3, 27).unwrap(), // My bday
-        NaiveDate::from_ymd_opt(year, 11, 17).unwrap(), // Averee bday
-        NaiveDate::from_ymd_opt(year, 12, 25).unwrap(), // Christmas
-    ];
     let total_days = (end_date - start_date).num_days() as i32;
 
     // For the 'days off' task we need to approximate the period based on the periods of other tasks
