@@ -1,17 +1,18 @@
 // #![allow(unused)]
 
+use crate::generator::generate_cleaning_list;
 use clap::Parser;
-use generator::generate_cleaning_list;
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use crate::generator::DatedTask;
 use crate::loader::{get_history, get_holidays, get_tasks, TaskRow};
+use crate::task::DatedTask;
 
 mod generator;
 mod loader;
+mod task;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -42,7 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let cleaning_list = generate_cleaning_list(&tasks, &holidays, history, year, seed);
     println!("Finished generating cleaning list!");
 
-    print_summary(&tasks, &cleaning_list);
+    // print_summary(&tasks, &cleaning_list);
 
     // Create TSV string (an extra tab is placed after date column for the checkbox column)
     let tsv = cleaning_list
@@ -61,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     //         )
     //     })
     //     .collect::<Vec<String>>()
-    //     .join("\n")
+    //     .join("\n");
 
     let path = Path::new("output/cleaning-list.tsv");
     let mut tsv_file = File::create(path)?;
@@ -72,6 +73,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn print_summary(tasks: &[TaskRow], cleaning_list: &[DatedTask]) {
     println!("Summary:");
     println!("period | count | task");

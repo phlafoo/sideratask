@@ -2,6 +2,8 @@ use chrono::NaiveDate;
 use serde::{de, Deserialize};
 use std::error::Error;
 
+use crate::task::AnnualWindow;
+
 // Variants map to google sheets drop down options
 #[derive(Copy, Clone, Debug, Default, Deserialize)]
 pub enum Area {
@@ -28,6 +30,15 @@ pub enum Season {
     #[default]
     Any,
     Summer,
+}
+
+impl Season {
+    pub const SUMMER_WINDOW: AnnualWindow = AnnualWindow {
+        start_month: 5,
+        start_day: 1,
+        end_month: 8,
+        end_day: 31,
+    };
 }
 
 /// Fields map to headers in google sheet
@@ -112,8 +123,6 @@ pub fn get_holidays(sheet_id: &str, year: i32) -> Result<Vec<NaiveDate>, Box<dyn
     let response = reqwest::blocking::get(sheet_url)?;
     response.error_for_status_ref().unwrap();
     let csv = response.text()?;
-
-    dbg!(csv.clone());
 
     // Parse the CSV data
     let mut reader = csv::Reader::from_reader(csv.as_bytes());
